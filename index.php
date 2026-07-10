@@ -1,7 +1,4 @@
 <?php
-// ─── Config file path (same directory as this script) ───────────────────────
-define('CONFIG_FILE', __DIR__ . '/pw_config.json');
-
 // ─── CORS headers ────────────────────────────────────────────────────────────
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: POST, OPTIONS');
@@ -24,128 +21,17 @@ function makeUUID(): string {
         random_int(0, 0xFFFFFFFFFFFF));
 }
 
-// ─── Config load / save ──────────────────────────────────────────────────────
+// ─── DIRECT TOKEN ────────────────────────────────────────────────────────────
+define('ACCESS_TOKEN', 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJleHAiOjE3ODQyODMxMjYuOTY3LCJkYXRhIjp7Il9pZCI6IjY2ODBiNTJlZTY4ZWI0NDQ3ZDU1NzY3MyIsInVzZXJuYW1lIjoiOTExMDkyOTgzMCIsImZpcnN0TmFtZSI6IkFrYXNoIiwibGFzdE5hbWUiOiJLdW1hciIsIm9yZ2FuaXphdGlvbiI6eyJfaWQiOiI1ZWIzOTNlZTk1ZmFiNzQ2OGE3OWQxODkiLCJ3ZWJzaXRlIjoicGh5c2ljc3dhbGxhaC5jb20iLCJuYW1lIjoiUGh5c2ljc3dhbGxhaCJ9LCJlbWFpbCI6ImRoaXJhamt1bWFya29pbHdlckBnbWFpbC5jb20iLCJyb2xlcyI6WyI1YjI3YmQ5NjU4NDJmOTUwYTc3OGM2ZWYiXSwiY291bnRyeUdyb3VwIjoiSU4iLCJvbmVSb2xlcyI6W10sInR5cGUiOiJVU0VSIn0sImp0aSI6IlpMeDhpY3gtVFgtOW05UVlLLWtZZ3dfNjY4MGI1MmVlNjhlYjQ0NDdkNTU3NjczIiwiaWF0IjoxNzgzNjc4MzI2fQ.AisrIGruh5au77ST7HyTWsSC_p1NXyzUm4F7Mq-FSF4');
 
-/**
- * Load config from pw_config.json.
- * Expected structure:
- * {
- *   "access_token":  "...",
- *   "refresh_token": "...",
- *   "client_secret": "...",
- *   "expires_in":    1781662175866   ← millisecond timestamp from PW API
- * }
- */
-function loadConfig(): array {
-    if (!file_exists(CONFIG_FILE)) return [];
-    $raw = file_get_contents(CONFIG_FILE);
-    return json_decode($raw, true) ?? [];
-}
-
-function saveConfig(array $cfg): void {
-    file_put_contents(CONFIG_FILE, json_encode($cfg, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
-}
-
-// ─── Token refresh ───────────────────────────────────────────────────────────
-
-/**
- * Call PW refresh-token endpoint, update config file, return new access_token.
- * Returns null on failure.
- */
-function refreshAccessToken(array &$cfg): ?string {
-    $refreshToken  = $cfg['refresh_token']  ?? '';
-    $clientSecret  = $cfg['client_secret']  ?? '';
-    if (!$refreshToken || !$clientSecret) return null;
-
-    $body = json_encode([
-        'refresh_token' => $refreshToken,
-        'client_secret' => $clientSecret,
-        'client_id'     => 'system-admin',
-    ]);
-
-    $headers = [
-        'authority: api.penpencil.co',
-        'accept: */*',
-        'accept-language: en-US,en;q=0.9',
-        'client-id: 5eb393ee95fab7468a79d189',
-        'client-type: WEB',
-        'content-type: application/json',
-        'origin: https://www.pw.live',
-        'randomid: ' . makeUUID(),
-        'referer: https://www.pw.live/',
-        'sec-ch-ua: "Chromium";v="137", "Not/A)Brand";v="24"',
-        'sec-ch-ua-mobile: ?1',
-        'sec-ch-ua-platform: "Android"',
-        'sec-fetch-dest: empty',
-        'sec-fetch-mode: cors',
-        'sec-fetch-site: cross-site',
-        'user-agent: Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36',
-    ];
-
-    $ch = curl_init('https://api.penpencil.co/v3/oauth/refresh-token');
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 30,
-        CURLOPT_POST           => true,
-        CURLOPT_POSTFIELDS     => $body,
-        CURLOPT_HTTPHEADER     => $headers,
-        CURLOPT_SSL_VERIFYPEER => true,
-    ]);
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-
-    if ($httpCode !== 200) return null;
-
-    $data = json_decode($response, true);
-    if (empty($data['success']) || empty($data['data']['access_token'])) return null;
-
-    // Persist new tokens
-    $cfg['access_token']  = $data['data']['access_token'];
-    $cfg['refresh_token'] = $data['data']['refresh_token'] ?? $cfg['refresh_token'];
-    $cfg['expires_in']    = $data['data']['expires_in']    ?? 0;
-    saveConfig($cfg);
-
-    return $cfg['access_token'];
-}
-
-// ─── Get a valid access token (auto-refresh if expired / missing) ─────────────
-
-/**
- * expires_in from PW API is a millisecond epoch timestamp.
- * We treat the token as expired 60 seconds before the actual expiry
- * to avoid using a token that expires mid-request.
- */
-function getValidToken(): string {
-    $cfg = loadConfig();
-
-    $accessToken = $cfg['access_token'] ?? '';
-    $expiresIn   = (int)($cfg['expires_in'] ?? 0);
-
-    // Check if token is missing or about to expire (within 60 s)
-    $nowMs         = (int)(microtime(true) * 1000);
-    $bufferMs      = 60 * 1000; // 60 seconds in ms
-    $isExpired     = ($expiresIn === 0) || ($nowMs >= ($expiresIn - $bufferMs));
-
-    if (!$accessToken || $isExpired) {
-        $newToken = refreshAccessToken($cfg);
-        if ($newToken) return $newToken;
-        // If refresh failed, fall back to whatever we have (may be empty)
-        return $accessToken;
-    }
-
-    return $accessToken;
-}
-
-// ─── PW request helpers ───────────────────────────────────────────────────────
+// ─── PW request helpers ─────────────────────────────────────────────────────
 
 function pwHeaders(string $host = 'api.penpencil.co'): array {
-    $token = getValidToken();
     return [
         "Host: $host",
         "Accept: */*",
         "Accept-Language: en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Authorization: Bearer $token",
+        "Authorization: Bearer " . ACCESS_TOKEN,
         "client-id: 5eb393ee95fab7468a79d189",
         "client-type: WEB",
         "client-version: 200",
@@ -193,33 +79,6 @@ function errorResp(?string $msg = null): void {
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 switch ($action) {
-
-    // ── Save / update credentials ──────────────────────────────────────────────
-    // POST ?action=set_credentials
-    // Body: { "access_token": "...", "refresh_token": "...", "client_secret": "...", "expires_in": 1781662175866 }
-    case 'set_credentials': {
-        $required = ['refresh_token', 'client_secret'];
-        foreach ($required as $key) {
-            if (empty($input[$key])) errorResp("$key is required");
-        }
-        $cfg = loadConfig(); // preserve any existing keys
-        $cfg['access_token']  = $input['access_token']  ?? ($cfg['access_token'] ?? '');
-        $cfg['refresh_token'] = $input['refresh_token'];
-        $cfg['client_secret'] = $input['client_secret'];
-        $cfg['expires_in']    = (int)($input['expires_in'] ?? 0);
-        saveConfig($cfg);
-        echo json_encode(['success' => true, 'message' => 'Credentials saved.']); break;
-    }
-
-    // ── Force refresh token now ────────────────────────────────────────────────
-    case 'force_refresh': {
-        $cfg = loadConfig();
-        $token = refreshAccessToken($cfg);
-        if (!$token) errorResp('Token refresh failed. Check refresh_token and client_secret in config.');
-        echo json_encode(['success' => true, 'message' => 'Token refreshed.', 'expires_in' => $cfg['expires_in']]); break;
-    }
-
-    // ── Original routes (unchanged logic) ─────────────────────────────────────
 
     case 'get_contents': {
         $batch_id       = $input['batch_id']       ?? null;
@@ -337,7 +196,6 @@ switch ($action) {
             'success'   => false,
             'message'   => 'Unknown action',
             'available' => [
-                'set_credentials','force_refresh',
                 'get_contents','get_slides','get_schedule_details','today_schedule',
                 'get_dpp','get_test_instructions','get_test_filters','get_tests',
                 'get_topics','get_community_channels','get_community_posts',
